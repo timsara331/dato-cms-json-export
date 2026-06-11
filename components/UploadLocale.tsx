@@ -2,6 +2,7 @@
 
 import { useRef, useState } from 'react';
 import { DatoField, DatoModel } from '@/lib/types';
+import JsonEditor from './JsonEditor';
 
 interface Props {
   models: DatoModel[];
@@ -24,24 +25,9 @@ function extractRecords(json: unknown): unknown[] {
 }
 
 function resolveFields(records: unknown[], models: DatoModel[]): DatoField[] | null {
-  // Pull the item_type id from the first record — works for both raw CMA
-  // shape (relationships.item_type.data.id) and our flattened shape (item_type.id)
   const first = records[0] as Record<string, unknown> | undefined;
   if (!first) return null;
-
-  const itemTypeId =
-    (first?.relationships as Record<string, unknown> | undefined)
-      ?.item_type as Record<string, unknown> | undefined
-      ? ((first.relationships as Record<string, unknown>).item_type as Record<string, unknown>)
-          ?.data
-        ? (
-            (
-              (first.relationships as Record<string, unknown>).item_type as Record<string, unknown>
-            ).data as Record<string, unknown>
-          ).id
-        : undefined
-      : (first?.item_type as Record<string, unknown> | undefined)?.id;
-
+  const itemTypeId = (first?.item_type as Record<string, unknown> | undefined)?.id as string | undefined;
   if (!itemTypeId) return null;
   return models.find((m) => m.id === itemTypeId)?.fields ?? null;
 }
@@ -51,7 +37,8 @@ export default function UploadLocale({ models, availableLocales }: Props) {
   const [targetLocale, setTargetLocale] = useState('');
   const [customLocale, setCustomLocale] = useState('');
   const [fileName, setFileName] = useState<string | null>(null);
-  const [parsedRecords, setParsedRecords] = useState<unknown[] | null>(null);
+  // editorText is the source of truth — parsed from file, editable, sent on upload
+  const [editorText, setEditorText] = useState<string | null>(null);
   const [resolvedFields, setResolvedFields] = useState<DatoField[] | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -60,11 +47,20 @@ export default function UploadLocale({ models, availableLocales }: Props) {
 
   const locale = targetLocale === '__custom__' ? customLocale.trim() : targetLocale;
 
+  // Try to parse records from current editor text
+  function parseEditorRecords(text: string): unknown[] | null {
+    try {
+      return extractRecords(JSON.parse(text));
+    } catch {
+      return null;
+    }
+  }
+
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
     setFileName(file.name);
-    setParsedRecords(null);
+    setEditorText(null);
     setResolvedFields(null);
     setParseError(null);
     setResults(null);
@@ -73,10 +69,11 @@ export default function UploadLocale({ models, availableLocales }: Props) {
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const json = JSON.parse(ev.target?.result as string);
+        const raw = ev.target?.result as string;
+        const json = JSON.parse(raw);
         const records = extractRecords(json);
         const fields = resolveFields(records, models);
-        setParsedRecords(records);
+        setEditorText(JSON.stringify(json, null, 2));
         setResolvedFields(fields);
       } catch (err) {
         setParseError(err instanceof Error ? err.message : 'Invalid JSON');
@@ -86,7 +83,14 @@ export default function UploadLocale({ models, availableLocales }: Props) {
   }
 
   async function handleUpload() {
-    if (!parsedRecords || !locale || !resolvedFields) return;
+    if (!editorText || !locale) return;
+
+    const records = parseEditorRecords(editorText);
+    if (!records) {
+      setUploadError('JSON is invalid — fix errors in the editor before uploading');
+      return;
+    }
+
     setUploading(true);
     setResults(null);
     setUploadError(null);
@@ -95,7 +99,7 @@ export default function UploadLocale({ models, availableLocales }: Props) {
       const res = await fetch('/api/upload-locale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: parsedRecords, targetLocale: locale }),
+        body: JSON.stringify({ records, targetLocale: locale }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -107,18 +111,19 @@ export default function UploadLocale({ models, availableLocales }: Props) {
     }
   }
 
+  const parsedRecords = editorText ? parseEditorRecords(editorText) : null;
+  const canUpload = !!parsedRecords && !!locale && !uploading;
+
   const updated = results?.filter((r) => r.status === 'updated').length ?? 0;
   const skipped = results?.filter((r) => r.status === 'skipped').length ?? 0;
   const errors = results?.filter((r) => r.status === 'error') ?? [];
-
-  const canUpload = !!parsedRecords && !!locale && !uploading;
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl p-6 flex flex-col gap-5">
       <div>
         <h2 className="text-base font-semibold text-gray-900">Upload Translated JSON</h2>
         <p className="text-sm text-gray-500 mt-0.5">
-          Upload a translated JSON file to write its content back as a localized version in DatoCMS
+          Upload a translated JSON file, edit it to remap locale keys if needed, then write it back to DatoCMS
         </p>
       </div>
 
@@ -184,26 +189,32 @@ export default function UploadLocale({ models, availableLocales }: Props) {
         </button>
       </div>
 
-      {/* Parse state */}
-      {parsedRecords && !parseError && (
-        <div className="flex flex-col gap-1">
-          <p className="text-sm text-gray-600">
-            {parsedRecords.length} record{parsedRecords.length !== 1 ? 's' : ''} ready to upload
-            {resolvedFields
-              ? ` · ${resolvedFields.filter((f) => f.localized).length} localized fields detected`
-              : ' · model not recognized — field schema unavailable'}
-          </p>
-          {!resolvedFields && (
-            <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-              Could not resolve the content model from this file. Make sure the JSON was exported from this app and the models have finished loading.
-            </p>
-          )}
-        </div>
-      )}
+      {/* Parse error from file load */}
       {parseError && (
         <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
           {parseError}
         </p>
+      )}
+
+      {/* Editor — shown once a file is loaded */}
+      {editorText !== null && (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center justify-between">
+            <p className="text-sm font-medium text-gray-700">Edit JSON</p>
+            {parsedRecords && (
+              <p className="text-xs text-gray-500">
+                {parsedRecords.length} record{parsedRecords.length !== 1 ? 's' : ''}
+                {resolvedFields
+                  ? ` · ${resolvedFields.filter((f) => f.localized).length} localized fields`
+                  : ''}
+              </p>
+            )}
+          </div>
+          <JsonEditor
+            value={editorText}
+            onChange={setEditorText}
+          />
+        </div>
       )}
 
       {/* Upload error */}
@@ -223,7 +234,6 @@ export default function UploadLocale({ models, availableLocales }: Props) {
               <span className="text-red-600 font-medium">{errors.length} failed</span>
             )}
           </div>
-
           {errors.length > 0 && (
             <div className="border border-red-200 rounded-lg divide-y divide-red-100 text-sm">
               {errors.map((r) => (
