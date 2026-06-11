@@ -54,45 +54,56 @@ export async function POST(req: NextRequest) {
         // Fetch the current record so we can merge into existing locales
         const existing = await client.items.find(recordId);
 
-        // Build the attributes patch: for each localized field, merge the
-        // incoming value for targetLocale into the existing locale map.
+        // Check whether the target locale already exists on this record.
+        // We detect this by inspecting the first localized field that has data.
+        const existingRecord = existing as unknown as Record<string, unknown>;
+        const isNewLocale = localizedFields.every((f) => {
+          const val = existingRecord[f.api_key];
+          if (!val || typeof val !== 'object') return true;
+          return !(targetLocale in (val as Record<string, unknown>));
+        });
+
+        // Build the patch. When adding a brand-new locale, DatoCMS requires
+        // ALL localized fields to be present in the same update — even fields
+        // we have no translation for — with the new locale key explicitly set
+        // (null is acceptable). For existing locales a partial patch is fine.
         const patch: Record<string, unknown> = {};
+        let hasTranslatedValue = false;
 
         for (const field of localizedFields) {
           const incomingValue = incomingRecord[field.api_key];
-          if (incomingValue === undefined || incomingValue === null) continue;
 
           // The existing value is a locale map: { en: "...", fr: "..." }
-          // Cast through unknown since the CMA client types attributes loosely
           const existingLocaleMap =
-            (existing as unknown as Record<string, unknown>)[field.api_key] as
-              | Record<string, unknown>
-              | null
-              | undefined;
+            existingRecord[field.api_key] as Record<string, unknown> | null | undefined;
 
-          const merged: Record<string, unknown> = {
-            ...(existingLocaleMap ?? {}),
-          };
+          const merged: Record<string, unknown> = { ...(existingLocaleMap ?? {}) };
 
-          // The incoming value may already be a locale map (if the file was
-          // downloaded as-is) or a plain string (if translated externally).
-          if (typeof incomingValue === 'object' && incomingValue !== null) {
-            const localeMap = incomingValue as Record<string, unknown>;
-            // If the incoming JSON has the target locale key, use that value.
-            // Otherwise treat the whole object as the translated value.
-            if (targetLocale in localeMap) {
-              merged[targetLocale] = localeMap[targetLocale];
+          if (incomingValue !== undefined && incomingValue !== null) {
+            // The incoming value may already be a locale map (downloaded as-is)
+            // or a plain translated value.
+            if (typeof incomingValue === 'object') {
+              const localeMap = incomingValue as Record<string, unknown>;
+              merged[targetLocale] = targetLocale in localeMap
+                ? localeMap[targetLocale]
+                : incomingValue;
             } else {
               merged[targetLocale] = incomingValue;
             }
+            hasTranslatedValue = true;
+          } else if (isNewLocale) {
+            // No translation provided for this field, but we must include it
+            // with a null value when introducing the locale for the first time.
+            merged[targetLocale] = null;
           } else {
-            merged[targetLocale] = incomingValue;
+            // Existing locale, no new value — skip this field entirely.
+            continue;
           }
 
           patch[field.api_key] = merged;
         }
 
-        if (Object.keys(patch).length === 0) {
+        if (!hasTranslatedValue && !isNewLocale) {
           results.push({ id: recordId, status: 'skipped' });
           continue;
         }
