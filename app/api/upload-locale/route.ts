@@ -4,119 +4,154 @@ import { client } from '@/lib/datocms';
 export const dynamic = 'force-dynamic';
 
 interface UploadPayload {
-  // Array of raw DatoCMS record objects from the downloaded JSON
-  records: RawRecord[];
-  // The locale code to write translated values into (e.g. "fr", "de")
+  records: IncomingRecord[];
   targetLocale: string;
-  // Field schemas for the model so we know which fields are localized
-  fields: FieldSchema[];
 }
 
-interface RawRecord {
+interface IncomingRecord {
   id: string;
   [key: string]: unknown;
 }
 
-interface FieldSchema {
-  api_key: string;
-  field_type: string;
-  localized: boolean;
-}
+// Field types whose values we know how to extract translated text from
+const TRANSLATABLE_FIELD_TYPES = new Set([
+  'string',
+  'text',
+  'structured_text',
+  'seo',
+]);
 
-const TRANSLATABLE_FIELD_TYPES = new Set(['string', 'text', 'structured_text', 'seo']);
+/**
+ * Given a raw field value from the uploaded JSON, extract the scalar
+ * content value regardless of what locale key it was stored under.
+ *
+ * The uploaded file may have:
+ *   { "en": "Hello" }  — locale map, source locale differs from target
+ *   { "ja": "こんにちは" } — locale map, already keyed to target locale
+ *   "Hello"            — plain string (e.g. from an external tool)
+ */
+function extractValue(raw: unknown, targetLocale: string): unknown {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return raw;
+
+  const map = raw as Record<string, unknown>;
+
+  // If the target locale key is already present, use it directly
+  if (targetLocale in map) return map[targetLocale];
+
+  // Otherwise take the first non-null value — this is the translated content
+  // stored under the source locale key
+  return Object.values(map).find((v) => v !== null && v !== undefined) ?? null;
+}
 
 export async function POST(req: NextRequest) {
   try {
     const body: UploadPayload = await req.json();
-    const { records, targetLocale, fields } = body;
+    const { records: incomingRecords, targetLocale } = body;
 
     if (!targetLocale) {
       return NextResponse.json({ error: 'Missing targetLocale' }, { status: 400 });
     }
-    if (!Array.isArray(records) || records.length === 0) {
+    if (!Array.isArray(incomingRecords) || incomingRecords.length === 0) {
       return NextResponse.json({ error: 'No records provided' }, { status: 400 });
     }
 
-    const localizedFields = fields.filter(
-      (f) => f.localized && TRANSLATABLE_FIELD_TYPES.has(f.field_type)
-    );
+    // Cache field schemas per item_type so we only fetch once per model
+    const fieldSchemaCache = new Map<string, Awaited<ReturnType<typeof client.fields.list>>>();
+
+    async function getFields(itemTypeId: string) {
+      if (!fieldSchemaCache.has(itemTypeId)) {
+        fieldSchemaCache.set(itemTypeId, await client.fields.list(itemTypeId));
+      }
+      return fieldSchemaCache.get(itemTypeId)!;
+    }
 
     const results: { id: string; status: 'updated' | 'skipped' | 'error'; error?: string }[] = [];
 
-    for (const incomingRecord of records) {
-      const recordId = incomingRecord.id;
+    for (const incoming of incomingRecords) {
+      const recordId = incoming.id;
       if (!recordId) {
-        results.push({ id: '(unknown)', status: 'skipped', error: 'No id on record' });
+        results.push({ id: '(unknown)', status: 'skipped', error: 'Missing id' });
         continue;
       }
 
       try {
-        // Fetch the current record so we can merge into existing locales
+        // Fetch the live record via the CMA client to get current field values
+        // and resolve the item_type for the field schema lookup
         const existing = await client.items.find(recordId);
+        const existingAttrs = existing as unknown as Record<string, unknown>;
 
-        // Check whether the target locale already exists on this record.
-        // We detect this by inspecting the first localized field that has data.
-        const existingRecord = existing as unknown as Record<string, unknown>;
+        // Pull the item_type id from the CMA response relationships
+        const itemTypeId = (
+          existing as unknown as {
+            relationships?: { item_type?: { data?: { id?: string } } };
+          }
+        ).relationships?.item_type?.data?.id;
+
+        if (!itemTypeId) {
+          results.push({ id: recordId, status: 'error', error: 'Could not resolve item_type' });
+          continue;
+        }
+
+        // Get authoritative field schemas from the CMA — not from the client payload
+        const fields = await getFields(itemTypeId);
+        const localizedFields = fields.filter(
+          (f) => f.localized && TRANSLATABLE_FIELD_TYPES.has(f.field_type)
+        );
+
+        if (localizedFields.length === 0) {
+          results.push({ id: recordId, status: 'skipped' });
+          continue;
+        }
+
+        // Determine if this is a brand-new locale on this record.
+        // DatoCMS requires ALL localized fields to be present in a single
+        // update when introducing a new locale — even fields with no
+        // translation (null is acceptable).
         const isNewLocale = localizedFields.every((f) => {
-          const val = existingRecord[f.api_key];
-          if (!val || typeof val !== 'object') return true;
-          return !(targetLocale in (val as Record<string, unknown>));
+          const existing = existingAttrs[f.api_key];
+          if (!existing || typeof existing !== 'object') return true;
+          return !(targetLocale in (existing as Record<string, unknown>));
         });
 
-        // Build the patch. When adding a brand-new locale, DatoCMS requires
-        // ALL localized fields to be present in the same update — even fields
-        // we have no translation for — with the new locale key explicitly set
-        // (null is acceptable). For existing locales a partial patch is fine.
+        // Build the update payload field by field
         const patch: Record<string, unknown> = {};
-        let hasTranslatedValue = false;
+        let hasAnyTranslation = false;
 
         for (const field of localizedFields) {
-          const incomingValue = incomingRecord[field.api_key];
-
-          // The existing value is a locale map: { en: "...", fr: "..." }
+          const incomingRaw = incoming[field.api_key];
           const existingLocaleMap =
-            existingRecord[field.api_key] as Record<string, unknown> | null | undefined;
+            (existingAttrs[field.api_key] as Record<string, unknown> | null | undefined) ?? {};
 
-          const merged: Record<string, unknown> = { ...(existingLocaleMap ?? {}) };
+          // Start from the existing locale map so we never overwrite other locales
+          const merged: Record<string, unknown> = { ...existingLocaleMap };
 
-          if (incomingValue !== undefined && incomingValue !== null) {
-            // The incoming value is either:
-            // (a) a locale map from the downloaded JSON: { "en": "Hello" }
-            // (b) a plain translated value: "Bonjour"
-            //
-            // For (a) we extract the content value regardless of which locale
-            // key it's stored under — the target locale may differ from the
-            // source locale in the file (e.g. uploading "en" content as "ja").
-            if (typeof incomingValue === 'object' && !Array.isArray(incomingValue)) {
-              const localeMap = incomingValue as Record<string, unknown>;
-              // Prefer the target locale key if it already exists in the map,
-              // otherwise take the first non-null value (the source translation).
-              const extractedValue = targetLocale in localeMap
-                ? localeMap[targetLocale]
-                : Object.values(localeMap).find((v) => v !== null && v !== undefined) ?? null;
-              merged[targetLocale] = extractedValue;
-            } else {
-              merged[targetLocale] = incomingValue;
-            }
-            hasTranslatedValue = true;
+          if (incomingRaw !== undefined && incomingRaw !== null) {
+            merged[targetLocale] = extractValue(incomingRaw, targetLocale);
+            hasAnyTranslation = true;
           } else if (isNewLocale) {
-            // No translation provided for this field, but we must include it
-            // with a null value when introducing the locale for the first time.
+            // Must explicitly include the new locale key (null) on every
+            // localized field when introducing the locale for the first time
             merged[targetLocale] = null;
           } else {
-            // Existing locale, no new value — skip this field entirely.
+            // Existing locale, no new value for this field — omit it
             continue;
           }
 
           patch[field.api_key] = merged;
         }
 
-        if (!hasTranslatedValue && !isNewLocale) {
+        if (!hasAnyTranslation && !isNewLocale) {
           results.push({ id: recordId, status: 'skipped' });
           continue;
         }
 
-        await client.items.update(recordId, patch as Parameters<typeof client.items.update>[1]);
+        // Use the CMA client to write the update
+        await client.items.update(
+          recordId,
+          patch as Parameters<typeof client.items.update>[1],
+        );
+
         results.push({ id: recordId, status: 'updated' });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

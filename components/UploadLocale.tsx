@@ -95,7 +95,7 @@ export default function UploadLocale({ models, availableLocales }: Props) {
       const res = await fetch('/api/upload-locale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: parsedRecords, targetLocale: locale, fields: resolvedFields }),
+        body: JSON.stringify({ records: parsedRecords, targetLocale: locale }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -111,7 +111,7 @@ export default function UploadLocale({ models, availableLocales }: Props) {
   const skipped = results?.filter((r) => r.status === 'skipped').length ?? 0;
   const errors = results?.filter((r) => r.status === 'error') ?? [];
 
-  const canUpload = !!parsedRecords && !!locale && !!resolvedFields && !uploading;
+  const canUpload = !!parsedRecords && !!locale && !uploading;
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl p-6 flex flex-col gap-5">
