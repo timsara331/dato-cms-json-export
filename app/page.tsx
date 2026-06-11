@@ -225,20 +225,15 @@ export default function Home() {
               />
             )}
 
-            {/* Upload translated content back */}
-            {activeModel && (
-              <UploadLocale
-                fields={activeModel.fields}
-                availableLocales={siteLocales}
-              />
-            )}
-
             {/* JSON viewer */}
             <div className="bg-white border border-gray-200 rounded-xl p-6">
               <JsonViewer data={result} />
             </div>
           </div>
         )}
+
+        {/* Upload panel — always visible */}
+        <UploadLocale models={models} availableLocales={siteLocales} />
 
         {loading && (
           <div className="bg-white border border-gray-200 rounded-xl p-12 flex items-center justify-center">

@@ -1,21 +1,58 @@
 'use client';
 
 import { useRef, useState } from 'react';
-import { DatoField } from '@/lib/types';
+import { DatoField, DatoModel } from '@/lib/types';
 
 interface Props {
-  fields: DatoField[];
+  models: DatoModel[];
   availableLocales: string[];
 }
 
 type UploadResult = { id: string; status: 'updated' | 'skipped' | 'error'; error?: string };
 
-export default function UploadLocale({ fields, availableLocales }: Props) {
+function extractRecords(json: unknown): unknown[] {
+  if (Array.isArray(json)) return json;
+  if (json && typeof json === 'object') {
+    const obj = json as Record<string, unknown>;
+    if (Array.isArray(obj.records)) return obj.records;
+    if (obj.data && Array.isArray(obj.data)) return obj.data;
+    if (obj.id) return [json];
+  }
+  throw new Error(
+    'Could not find records in JSON. Expected an array, a single record object, or { records: [...] }.'
+  );
+}
+
+function resolveFields(records: unknown[], models: DatoModel[]): DatoField[] | null {
+  // Pull the item_type id from the first record — works for both raw CMA
+  // shape (relationships.item_type.data.id) and our flattened shape (item_type.id)
+  const first = records[0] as Record<string, unknown> | undefined;
+  if (!first) return null;
+
+  const itemTypeId =
+    (first?.relationships as Record<string, unknown> | undefined)
+      ?.item_type as Record<string, unknown> | undefined
+      ? ((first.relationships as Record<string, unknown>).item_type as Record<string, unknown>)
+          ?.data
+        ? (
+            (
+              (first.relationships as Record<string, unknown>).item_type as Record<string, unknown>
+            ).data as Record<string, unknown>
+          ).id
+        : undefined
+      : (first?.item_type as Record<string, unknown> | undefined)?.id;
+
+  if (!itemTypeId) return null;
+  return models.find((m) => m.id === itemTypeId)?.fields ?? null;
+}
+
+export default function UploadLocale({ models, availableLocales }: Props) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [targetLocale, setTargetLocale] = useState('');
   const [customLocale, setCustomLocale] = useState('');
   const [fileName, setFileName] = useState<string | null>(null);
   const [parsedRecords, setParsedRecords] = useState<unknown[] | null>(null);
+  const [resolvedFields, setResolvedFields] = useState<DatoField[] | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [results, setResults] = useState<UploadResult[] | null>(null);
@@ -28,6 +65,7 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
     if (!file) return;
     setFileName(file.name);
     setParsedRecords(null);
+    setResolvedFields(null);
     setParseError(null);
     setResults(null);
     setUploadError(null);
@@ -36,18 +74,10 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
     reader.onload = (ev) => {
       try {
         const json = JSON.parse(ev.target?.result as string);
-        // Accept either a single record, an array, or { records: [...] }
-        let records: unknown[];
-        if (Array.isArray(json)) {
-          records = json;
-        } else if (json && typeof json === 'object' && Array.isArray((json as Record<string, unknown>).records)) {
-          records = (json as Record<string, unknown>).records as unknown[];
-        } else if (json && typeof json === 'object' && (json as Record<string, unknown>).id) {
-          records = [json];
-        } else {
-          throw new Error('Could not find records in JSON. Expected an array, a single record object, or { records: [...] }.');
-        }
+        const records = extractRecords(json);
+        const fields = resolveFields(records, models);
         setParsedRecords(records);
+        setResolvedFields(fields);
       } catch (err) {
         setParseError(err instanceof Error ? err.message : 'Invalid JSON');
       }
@@ -56,7 +86,7 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
   }
 
   async function handleUpload() {
-    if (!parsedRecords || !locale) return;
+    if (!parsedRecords || !locale || !resolvedFields) return;
     setUploading(true);
     setResults(null);
     setUploadError(null);
@@ -65,7 +95,7 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
       const res = await fetch('/api/upload-locale', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ records: parsedRecords, targetLocale: locale, fields }),
+        body: JSON.stringify({ records: parsedRecords, targetLocale: locale, fields: resolvedFields }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -80,6 +110,8 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
   const updated = results?.filter((r) => r.status === 'updated').length ?? 0;
   const skipped = results?.filter((r) => r.status === 'skipped').length ?? 0;
   const errors = results?.filter((r) => r.status === 'error') ?? [];
+
+  const canUpload = !!parsedRecords && !!locale && !!resolvedFields && !uploading;
 
   return (
     <div className="bg-white border border-gray-200 rounded-xl p-6 flex flex-col gap-5">
@@ -145,18 +177,28 @@ export default function UploadLocale({ fields, availableLocales }: Props) {
 
         <button
           onClick={handleUpload}
-          disabled={!parsedRecords || !locale || uploading}
+          disabled={!canUpload}
           className="bg-green-600 hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white text-sm font-medium px-5 py-2 rounded-lg transition-colors"
         >
-          {uploading ? 'Uploading…' : `Upload to DatoCMS`}
+          {uploading ? 'Uploading…' : 'Upload to DatoCMS'}
         </button>
       </div>
 
       {/* Parse state */}
       {parsedRecords && !parseError && (
-        <p className="text-sm text-gray-600">
-          {parsedRecords.length} record{parsedRecords.length !== 1 ? 's' : ''} ready to upload
-        </p>
+        <div className="flex flex-col gap-1">
+          <p className="text-sm text-gray-600">
+            {parsedRecords.length} record{parsedRecords.length !== 1 ? 's' : ''} ready to upload
+            {resolvedFields
+              ? ` · ${resolvedFields.filter((f) => f.localized).length} localized fields detected`
+              : ' · model not recognized — field schema unavailable'}
+          </p>
+          {!resolvedFields && (
+            <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+              Could not resolve the content model from this file. Make sure the JSON was exported from this app and the models have finished loading.
+            </p>
+          )}
+        </div>
       )}
       {parseError && (
         <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
