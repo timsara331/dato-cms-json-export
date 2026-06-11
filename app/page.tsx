@@ -213,6 +213,7 @@ export default function Home() {
             {/* Download panel */}
             {displayRecords.length > 0 && activeModel && (
               <DownloadButton
+                rawResult={result}
                 records={displayRecords}
                 fields={activeModel.fields}
                 modelApiKey={activeModel.api_key}
