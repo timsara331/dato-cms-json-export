@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import ModelSelector from '@/components/ModelSelector';
 import JsonViewer from '@/components/JsonViewer';
 import DownloadButton from '@/components/DownloadButton';
+import UploadLocale from '@/components/UploadLocale';
 import { DatoModel, DatoRecord } from '@/lib/types';
 
 type QueryMode = 'all' | 'byId';
@@ -17,6 +18,7 @@ interface RecordsResult {
 
 export default function Home() {
   const [models, setModels] = useState<DatoModel[]>([]);
+  const [siteLocales, setSiteLocales] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<DatoModel | null>(null);
   const [activeModel, setActiveModel] = useState<DatoModel | null>(null); // model for current result
   const [queryMode, setQueryMode] = useState<QueryMode>('all');
@@ -26,11 +28,14 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [currentPage, setCurrentPage] = useState(0);
 
-  // Load models once so byId queries can resolve the model for the download button
   useEffect(() => {
     fetch('/api/models')
       .then((r) => r.json())
       .then((data) => { if (!data.error) setModels(data); })
+      .catch(() => {});
+    fetch('/api/locales')
+      .then((r) => r.json())
+      .then((data) => { if (!data.error) setSiteLocales(data.locales ?? []); })
       .catch(() => {});
   }, []);
 
@@ -217,6 +222,14 @@ export default function Home() {
                 records={displayRecords}
                 fields={activeModel.fields}
                 modelApiKey={activeModel.api_key}
+              />
+            )}
+
+            {/* Upload translated content back */}
+            {activeModel && (
+              <UploadLocale
+                fields={activeModel.fields}
+                availableLocales={siteLocales}
               />
             )}
 
