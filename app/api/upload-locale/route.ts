@@ -81,12 +81,10 @@ export async function POST(req: NextRequest) {
         const existing = await client.items.find(recordId);
         const existingAttrs = existing as unknown as Record<string, unknown>;
 
-        // Pull the item_type id from the CMA response relationships
+        // item_type is a top-level field on the simple client response
         const itemTypeId = (
-          existing as unknown as {
-            relationships?: { item_type?: { data?: { id?: string } } };
-          }
-        ).relationships?.item_type?.data?.id;
+          existing as unknown as { item_type?: { id?: string } }
+        ).item_type?.id;
 
         if (!itemTypeId) {
           results.push({ id: recordId, status: 'error', error: 'Could not resolve item_type' });
