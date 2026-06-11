@@ -80,13 +80,21 @@ export async function POST(req: NextRequest) {
           const merged: Record<string, unknown> = { ...(existingLocaleMap ?? {}) };
 
           if (incomingValue !== undefined && incomingValue !== null) {
-            // The incoming value may already be a locale map (downloaded as-is)
-            // or a plain translated value.
-            if (typeof incomingValue === 'object') {
+            // The incoming value is either:
+            // (a) a locale map from the downloaded JSON: { "en": "Hello" }
+            // (b) a plain translated value: "Bonjour"
+            //
+            // For (a) we extract the content value regardless of which locale
+            // key it's stored under — the target locale may differ from the
+            // source locale in the file (e.g. uploading "en" content as "ja").
+            if (typeof incomingValue === 'object' && !Array.isArray(incomingValue)) {
               const localeMap = incomingValue as Record<string, unknown>;
-              merged[targetLocale] = targetLocale in localeMap
+              // Prefer the target locale key if it already exists in the map,
+              // otherwise take the first non-null value (the source translation).
+              const extractedValue = targetLocale in localeMap
                 ? localeMap[targetLocale]
-                : incomingValue;
+                : Object.values(localeMap).find((v) => v !== null && v !== undefined) ?? null;
+              merged[targetLocale] = extractedValue;
             } else {
               merged[targetLocale] = incomingValue;
             }
